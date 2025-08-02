@@ -1,0 +1,268 @@
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.10.5
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@${REDIS_HOST}:${REDIS_PORT}/0
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'true'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./plugins:/opt/airflow/plugins
+    - ./notebooks:/opt/airflow/notebooks
+    - ./requirements.txt:/requirements.txt
+    - ./weather_data/raw:/opt/airflow/weather_data/raw:rw
+    - ./weather_data/archive:/opt/airflow/weather_data/archive:rw
+    - ./test_data:/opt/airflow/test_data:rw
+    - ./jars:/opt/airflow/jars
+  user: "${AIRFLOW_UID}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+  networks:
+    - wdata-bridge-net
+  command: bash -c "env && sleep 600"   # 👈 TEMPORARY for debug
+
+services:
+  # Airflow Services
+  postgres:
+    image: postgres:13
+    env_file:
+      - .env
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - wdata-bridge-net
+
+  redis:
+    image: redis:7.2-bookworm
+    env_file:
+      - .env
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+    networks:
+      - wdata-bridge-net
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+      DW_HOST: ${DW_HOST}
+      DW_PORT: ${DW_PORT}
+      DW_DB: ${DW_DB}
+      DW_USER: ${DW_USER}
+      DW_PASSWORD: ${DW_PASSWORD}
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      data-warehouse:
+        condition: service_healthy
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+    volumes:
+      - .:/sources
+    networks:
+      - wdata-bridge-net
+
+  # Data Warehouse Postgres
+  data-warehouse:
+    image: postgres:13
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${DW_USER}
+      POSTGRES_PASSWORD: ${DW_PASSWORD}
+      POSTGRES_DB: ${DW_DB}
+    volumes:
+      - data-warehouse-volume:/var/lib/postgresql/data
+      - ./sql_scripts/create_schemas.sql:/docker-entrypoint-initdb.d/create_schemas.sql
+      - ./sql_scripts/init_superset_db.sql:/docker-entrypoint-initdb.d/init_superset_db.sql  
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${DW_USER}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - wdata-bridge-net
+
+  # pgAdmin Service
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    env_file:
+      - .env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    ports:
+      - "5050:80"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      - postgres
+      - data-warehouse
+    networks:
+      - wdata-bridge-net
+
+  # Apache Superset Service
+  superset:
+    image: apache/superset:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.superset
+    env_file:
+      - .env
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_DATABASE_URL: postgresql+psycopg2://${DW_USER}:${DW_PASSWORD}@data-warehouse:5432/superset_db
+    volumes:
+      - superset-home:/app/superset_home
+      - ./superset_config.py:/app/superset_home/superset_config.py
+    ports:
+      - "8088:8088"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      data-warehouse:
+        condition: service_healthy
+    networks:
+      - wdata-bridge-net
+    command: >
+      /bin/sh -c "
+        echo 'Starting Superset initialization' &&
+        superset db upgrade &&
+        superset init &&
+        superset fab create-admin --username ${SUPERSET_ADMIN_USERNAME} --firstname Admin --lastname User --email ${SUPERSET_ADMIN_EMAIL} --password ${SUPERSET_ADMIN_PASSWORD} || echo 'Admin user creation failed (likely exists)' &&
+        superset set-database-uri --database_name data_warehouse_db --uri 'postgresql+psycopg2://${DW_USER}:${DW_PASSWORD}@data-warehouse:5432/${DW_DB}' || echo 'Failed to set database URI' &&
+        echo 'Superset initialization completed' &&
+        gunicorn --bind 0.0.0.0:8088 'superset.app:create_app()'
+      "
+volumes:
+  postgres-db-volume:
+  data-warehouse-volume:
+  pgadmin-data:
+  notebooks:
+  superset-home:
+
+networks:
+  wdata-bridge-net:
+    driver: bridge
+    

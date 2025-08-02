@@ -1,0 +1,7 @@
+apache-airflow-providers-apache-spark==4.6.0
+papermill==2.5.0
+pyspark==3.5.3
+jupyter==1.0.0
+ipykernel==6.29.3
+requests==2.31.0
+urllib3==2.2.1
